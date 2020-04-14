@@ -1,0 +1,17 @@
+#!/bin/bash
+
+. /opt/tools/load-environment
+
+[ -z "$1" ] && fail "Missing argument direcotry where are stored backups"
+[ -e "$1" ] || fail "Given argument \x1b[35m$1\x1b[0m is does not exitst"
+[ -d "$1" ] || fail "Given argument \x1b[35m$1\x1b[0m is not directory"
+
+lp remove-very-old-backups find "$1" -mtime +"$KEEP_BACKUPS_MAX" -type f -delete -print
+find "$1" -type d -exec bash -c 'echo "$(find "{}" -maxdepth 1 -type f -mtime +"'"$KEEP_BACKUPS"'" | wc -l) {}"' \; \
+| awk '$1 > 1 {$1=""; sub(/^ /,""); print}' \
+| while read; do
+    find "$REPLY" -maxdepth 1 -type f -mtime +"$KEEP_BACKUPS" -exec ls -t '{}' + \
+    | awk 'NR>1' \
+    | lp remove-old-backups xargs -d '\n' rm -v
+done
+lp remove-empty-dirs find "$1" -mindepth 1 -type d -empty -delete -print

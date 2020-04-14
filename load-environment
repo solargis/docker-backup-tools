@@ -1,0 +1,23 @@
+#!/bin/bash
+
+[ -r ~/.env ] && . ~/.env
+[ -z "$DOCKER_HOST" ] || unset DOCKER_HOST
+
+MOUNTDIR="${MOUNTDIR:-/mnt/backups}"
+KEEP_BACKUPS_MAX="${KEEP_BACKUPS_MAX:-1461}" # in days, 4 years
+KEEP_BACKUPS="${KEEP_BACKUPS:-168}" # in days, half year
+
+lp () {
+  if [ "$_label_outputs" == "on" ]; then
+    label-process-output -l "$@"
+  else
+    shift; while [ "${1:0:1}" == "-" ]; do shift; done
+    "$@"
+  fi
+}
+info() { [ $# -eq 0 ] && set -- "${MSG:-$(cat)}"; echo -e "\x1b[32;1mInfo:\x1b[0m" "$@"; }
+warn() { [ $# -eq 0 ] && set -- "${MSG:-$(cat)}"; echo -e "\x1b[33;1mWarn:\x1b[0m" "$@" >&2; }
+fail() { [ $# -eq 0 ] && set -- "${MSG:-$(cat)}"; echo -e "\x1b[31;1mError:\x1b[0m" "$@" >&2; exit 1; }
+
+# Usage: check-pipestatus "${PIPESTATUS[@]}"
+check-pipestatus() { local R="0"; while [ "$#" -gt 0 ]; do [ "$1" -gt "$R" ] && R="$1"; shift; done; return "$R"; }

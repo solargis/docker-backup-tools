@@ -1,0 +1,33 @@
+#!/bin/bash
+. /opt/tools/load-environment
+
+[ -z "$REMOTE" ] && fail "Missing required environment variable \x1b[35mREMOTE\x1b[0m='<user>@<remote-host>:</dir>'!"
+[ -z "$REMOTE_PASSWORD" -a -r /run/secrets/remote_password ] && REMOTE_PASSWORD="$(cat /run/secrets/remote_password)"
+[ -z "$REMOTE_PASSWORD" ] && fail "Missing required environment variable  \x1b[35mREMOTE_PASSWORD=\x1b[0m='<passord>'!"
+[ "${REMOTE_PASSWORD:0:7}" == "secret:" -a -r "${REMOTE_PASSWORD:7}" ] && REMOTE_PASSWORD="$(cat "${REMOTE_PASSWORD:7}")"
+
+case "$1" in
+mount|'')
+  if [ -d "$MOUNTDIR" ]; then
+    [ "$(find "$MOUNTDIR" -maxdepth 0 -type d -empty | wc -l)" -eq 1 ] \
+    || fail "Directory \x1b[35mMOUNTDIR=\x1b[1m$MOUNTDIR\x1b[0m already exists and is not empty!"
+  else lp mkdir mkdir "$MOUNTDIR" || exit
+  fi
+  lp mount sshfs "$REMOTE" "$MOUNTDIR" \
+  -o password_stdin -o uid=$(id -u) -o gid=$(id -g) \
+  -o umask=0077 -o allow_root -o StrictHostKeyChecking=accept-new <<< "$REMOTE_PASSWORD"
+  ;;
+-u|umount|unmount)
+  lp umount fusermount -u "$MOUNTDIR" && lp rmdir rmdir "$MOUNTDIR"
+  ;;
+-s|status|state)
+  STATE="$(mount | grep --color=always -F "$REMOTE")"
+  [ -z "$STATE" ] && echo "not currentry mounted" && exit 1 || echo "$STATE"
+  ;;
+*)
+  echo -e "Usage:
+  to mount:       \x1b[33mremote [mount]\x1b[0m
+  to unount:      \x1b[33mremote umount|-u\x1b[0m
+  to chcek state: \x1b[33mremote status|state|-s\x1b[0m"
+  exit 1
+esac

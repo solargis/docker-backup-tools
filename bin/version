@@ -1,0 +1,282 @@
+#!/usr/bin/env node
+
+const https = require('https');
+const { spawn } = require('child_process');
+const { Console } = require('console');
+const { resolve, join, dirname } = require('path');
+const { existsSync, mkdirSync, writeFileSync } = require('fs');
+
+const logger = new Console({ stdout: process.stderr });
+
+const dockerImageTagsChacheDir = process.env.TAG_VERSION_CACHE_DIR || resolve(__dirname, '..', '.cache', 'docker-image-tags');
+
+if (!existsSync(dockerImageTagsChacheDir)) mkdirSync(dockerImageTagsChacheDir, { recursive: true, mode: 0o770 });
+
+function asProcess(promise) {
+    promise.then(r => {
+        console.log(process.env.JSON_PRETTY === 'true' ?
+        JSON.stringify(r, null, 2) : JSON.stringify(r));
+    }).catch(e => {
+        console.error(e);
+        process.exit(e.statusCode || 1);
+    });
+}
+
+function fetchJSON(url) {
+    logger.info(`requesting: ${url}`);
+    return new Promise((resolve, reject) => https.get(url, res => {
+        let body = [];
+        res.on('data', chunk => body.push(chunk));
+        res.on('end', () => {
+            try { resolve(JSON.parse(body.join(''))); }
+            catch (error) { reject(error); }
+        });
+    }).on('error', reject));
+}
+
+
+const remoteTagUtils = {
+    hasNext() {
+        return !!this.next;
+    },
+    nextResults() {
+        if (this.hasNext()) {
+            return fetchJSON(this.next).then(response => {
+                this.next = response.next;
+                this.results = this.results.concat(response.results);
+                return response.results;
+            });
+        }
+        else return Promise.resolve([]);
+    },
+};
+
+// curl -L -s "https://registry.hub.docker.com/v2/repositories/rancher/rancher/tags?page_size=100" \
+// | jq ‘[.results[] | {tag: .name, lastUpdated: .last_updated, images: [.images[] | {architecture:.architecture,digest:.digest}]}]
+async function fetchRemoteTags(repo, limitEntries=100) {
+    let url = `https://registry.hub.docker.com/v2/repositories/${repo}/tags?page_size=${limitEntries}`;
+    const response = await fetchJSON(url);
+    Object.assign(response, remoteTagUtils);
+    return response;
+}
+
+const extractRepos = (tags, digests) => {
+    let result = {};
+    const resultItem = repo => result[repo] || (result[repo] = { tags: [], digests: [] });
+    tags.forEach(repo_tag => {
+        let [repo, tag] = repo_tag.split(':');
+        resultItem(repo).tags.push(tag);
+    });
+    digests.forEach(repo_digest => {
+        let [repo, digest] = repo_digest.split('@');
+        resultItem(repo).digests.push(digest);
+    });
+    return result;
+}
+
+/**
+ * @param input Array<string> | string
+ */
+function inspectDocker(input) {
+    return new Promise((resolve, reject) => {
+        let data = [];
+        let docker = spawn('docker', Array.isArray(input) ? ['inspect'].concat(input) : ['inspect', input], {
+            stdio: ['ignore', 'pipe', 'inherit'],
+        });
+        docker.stdout.on('data', chunk => data.push(chunk));
+        docker.on('close', statusCode => {
+            if (statusCode) reject(Object.assign(new Error('Child process "docker" does not finish sucessfuly!'), {statusCode}));
+            else try {
+                let results = JSON.parse(data.join('')).map(result => result.Image ? {
+                    container: {
+                        id: result.Id,
+                        name: result.Name.substr(1),
+                        image: (([repo, tag]) => ({repo,tag}))(result.Config.Image.split(':')),
+                    },
+                    image: { id: result.Image },
+                } : {
+                    image: {
+                        id: result.Id,
+                        created: result.Created,
+                        repo: extractRepos(result.RepoTags, result.RepoDigests),
+                    },
+                });
+
+                let promises = results.reduce((promises, result) => {
+                    if (result.container) {
+                        let imageResult = results.find(_ => !_.container && _.image.id === result.image.id);
+                        if (imageResult) result.image = imageResult.image;
+                        else promises.push(inspectDocker(result.image.id).then(([imageResult]) => {
+                            result.image = imageResult.image;
+                        }));
+                    }
+                    return promises;
+                }, []);
+                if (promises.length) Promise.all(promises).then(() => resolve(results)).catch(reject);
+                else resolve(results);
+            }
+            catch (e) { reject(e); }
+        });
+        docker.on('error', reject);
+    });
+}
+
+
+class TagList {
+    static cloneRecord = (record, architecture) => {
+        let result = Object.assign({}, record, {
+            images: record.images
+                .filter(img => !architecture || img.architecture === architecture)
+                .map(img => Object.assign({}, img)),
+        });
+        delete result.history;
+        return result;
+    };
+    static removeRecord = (records, record) => {
+        let i = records.indexOf(record);
+        if (i >= 0) records.splice(i, 1);
+        else throw new Error(`Illegal state! record: {name: ${JSON.stringify(record.name)}, ...} not found in array [\n  ${
+            records.map(record => `{name: ${JSON.stringify(record.name)}, ...}`).join(',\n  ')
+        }]`);
+    };
+
+    modified = false;
+
+    digestIndex = {};
+
+    tagIndex = {};
+
+    repo;
+
+    records;
+
+    removedRecords = null;
+
+    last_updated;
+
+    constructor(data) {
+        Object.assign(this, data);
+        this.records.forEach(rec => {
+            this.tagIndex[rec.name] = rec;
+            rec.images.forEach(img => (this.digestIndex[img.digest] || (this.digestIndex[img.digest] = [])).push(rec));
+        });
+    }
+
+    isEmpty() { return this.records.length === 0; }
+
+    tagsByDigests(digests, architecture) {
+        return digets.reduce((result, digest) => {
+            (this.digestIndex[digest] || []).forEach(record => (result||(result = {}))[record.name] = TagList.cloneRecord(record, architecture));
+            return result;
+        }, null);
+    }
+
+    getTag(tagName, architecture) {
+        return this.tagIndex[tagName] ? TagList.cloneRecord(this.tagIndex[tagName], architecture) : null;
+    }
+
+    insertTag(record) {
+        let old = this.tagIndex[record.name];
+        if (old) {
+            if (old.last_updated !== record.last_updated) {
+                record.history = [ old, ...(old.history || []) ];
+                delete old.removed;
+                delete old.history;
+                old.updated = Date.now();
+            }
+            
+            TagList.removeRecord(this.records, old);
+            
+            old.images.forEach(img => {
+                let records = this.digestIndex[img.digest];
+                TagList.removeRecord(records, old);
+                if (!records.length) delete this.digestIndex[img.digest];
+            });
+        }
+        this.records.unshift(record);
+        this.tagIndex[record.name] = record;
+        record.images.forEach(img => (this.digestIndex[img.digest] || (this.digestIndex[img.digest] = [])).unshift(record));
+    }
+
+    /**
+     * @param quitePeriod - time periad during it is not cheking updates. In milliseconds. Default 6 hours.
+     */
+    async update(quitePeriod = 6*60*60e3) {
+        if (quitePeriod && this.last_updated && Date.now() - new Date(this.last_updated).getTime() < quitePeriod) return null;
+        let result = 0;
+        this.last_updated = new Date().toISOString();
+        if (this.isEmpty()) {
+            let load = await fetchRemoteTags(this.repo);
+            while(load.hasNext()) await load.nextResults();
+            load.results.reverse().forEach(record => this.insertTag(record));
+            result = load.results.length;
+        }
+        else {
+            let load = await fetchRemoteTags(this.repo, 15);
+            let latest = this.records.find(rec => rec.name === 'latest');
+            let last = this.records.find(rec => rec.name !== 'latest') || latest;
+            let lastUpdatedIncludes = (record, i) => !(i === 0 && record.name === 'latest') || record.last_updated <= last.last_updated;
+            let lastIndex = load.results.findIndex(lastUpdatedIncludes);
+            while (lastIndex < 0 && load.hasNext()) {
+                if ((await load.nextResults()).findIndex(lastUpdatedIncludes) >= 0) {
+                    lastIndex = load.results.findIndex(lastUpdatedIncludes);
+                }
+            }
+            if (lastIndex < 0) { // all tags are updated?
+                this.records.forEach(record => record.removed = Date.now());
+                load.results.reverse().forEach(record => this.insertTag(record));
+                let removedRecords = this.records.filter(record => !!record.removed);
+                if (removedRecords.length) {
+                    this.records = this.records.filter(record => !record.removed);
+                    this.removedRecords = this.removedRecords ? removedRecords.concat(this.removedRecords) : removedRecords;
+                }
+                result = load.results.length + removedRecords.length;
+            }
+            else {
+                if (lastIndex === 1 && load.results[0].name === 'latest' && latest && latest.last_updated === load.results[0].last_updated) {
+                    lastIndex = 0;
+                }
+                result = lastIndex > 0;
+                if (result) load.results.slice(0, lastIndex).reverse().forEach(record => this.insertTag(record));
+            }
+        }
+        // sorting should be not necessary => do assert ordering
+        //this.records.sort((a, b) => a.last_updated < b.last_updated ? 1 : a.last_updated > b.last_updated ? -1 : 0);
+        if (this.records.length > 1) this.records.reduceRight((a, b) => {
+            if (a.name === 'latest' || b.name !== 'latest' && a.last_updated > b.last_updated) {
+                throw new Error(`Illegal state! ${b.last_updated}#:${b.name} is before ${a.last_updated}#:${a.name}`);
+            }
+            return b;
+        });
+        return result;
+    }
+
+    save(fileName) {
+        let data = { repo: this.repo, last_updated: this.last_updated, records: this.records };
+        if (this.removedRecords) data.removedRecords = this.removedRecords;
+        writeFileSync(fileName, JSON.stringify(data));
+    }
+
+    count() { return this.records.length; }
+}
+
+async function loadTags(repo) {
+    let tagListFile = join(dockerImageTagsChacheDir, ...(repo + '.list.json').split('/'));
+    if (!existsSync(dirname(tagListFile))) mkdirSync(dirname(tagListFile));
+    
+    let tagList = new TagList(existsSync(tagListFile) ? require(tagListFile) : {repo, records: []});
+    const updatedCount = await tagList.update();
+    if (updatedCount !== null) {
+        tagList.save(tagListFile);
+        logger.log(`updated ${updatedCount} tags for ${repo}`);
+    }
+    return tagList;
+}
+
+
+// asProcess(fetchRemoteTags('rancher/rancher', 20));
+//asProcess(inspectDocker('gitlab'));
+
+asProcess((async () => (await loadTags('rancher/rancher')))());
+// asProcess((async () => (await loadTags('solargis/backup')).count())());
+
