@@ -89,6 +89,16 @@ restore)
   done | jq -s '[.[]|._backup+{gitlabURL:.gitlab["external-url"],pagesURL:.gitlab["pages-external-url"]}]'
   "$0" umount || exit
   ;;
+remote)
+  shift
+  remote mount || exit
+  cd "$MOUNTDIR"
+  "$@"
+  RC="$?"
+  cd - > /dev/null
+  remote unmount || exit
+  exit "$?"
+  ;;
 *)
   [ -x ~/hooks/entrypoint ] && exec ~/hooks/entrypoint "$@" || exec "$@"
   ;;
