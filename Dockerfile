@@ -11,7 +11,7 @@ ARG DOCKER_COMPOSE=1.25.4
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     apt-transport-https ca-certificates curl gnupg-agent software-properties-common \
-    sshfs xz-utils jq tree \
+    sshfs xz-utils jq tree mysql-client \
   && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
   && add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
   && apt-get update \
